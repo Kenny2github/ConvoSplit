@@ -12,17 +12,28 @@ from discord.ext import commands
 
 CONFIG_FILE = 'convosplit.json'
 
+ERROR_FMT = '\N{CROSS MARK} **Error**: '
 NO_CAT_ERROR = """
 Missing channel category for temporary conversations.
 Please ask someone with permission to do so to create \
 a channel category with the word "ConvoSplit" anywhere \
 in the name.
 """.strip()
+NO_PERMS_ERROR = """
+Missing permissions to create new channels and edit their permissions.
+Please ask someone with permission to do so to grant me the ability to
+- create new channels
+- edit their permissions
+in the ConvoSplit channel category.
+""".strip()
 BOT_DESC = 'Split conversations into temporary channels'
 MEMBER_DESC = 'Member #%s you want to limit discussion to.'
 TIMEOUT_DESC = """
 How long (in minutes) the channel can remain inactive before it is deleted. \
 Default 5.
+""".strip()
+CHANNEL_DESC = """
+Once the conversation ends, (try to) send its archive to this channel.
 """.strip()
 NEW_CHANNEL_REASON = 'Creating temporary channel to split a conversation.'
 LOCK_REASON = 'Locking the channel while saving its messages.'
@@ -34,8 +45,9 @@ please move to {channel.mention} (convo {key}).
 CONVO_DONE = 'Conversation {key} finished:'
 PERMS_WARNING = """
 \N{WARNING SIGN} **Warning**: I cannot send messages with a file as a bot \
-in this channel. If the conversation (including ending inactivity, if any) \
-lasts more than 10 minutes, its log will be lost!
+in this channel or the `dest_channel` (if specified). If the conversation \
+(including ending inactivity, if any) lasts more than 10 minutes, its log \
+will be lost!
 """.strip()
 FILENAME_FMT = '{name}---{start:%Y-%m-%d %H-%M-%S}---{end:%Y-%m-%d %H-%M-%S}.txt'
 SEPARATOR = '--New Message Starts After Two Line Feeds After This Line'
@@ -62,11 +74,7 @@ client = slash.SlashBot(
 )
 
 async def send_error(method, msg):
-    await method(embed=discord.Embed(
-        title='Error',
-        description=msg,
-        color=0xff0000
-    ))
+    await method(ERROR_FMT + msg)
 
 @client.event
 async def on_command_error(ctx, exc):
@@ -136,14 +144,19 @@ async def create_channel(
         overwrites[ctx.author] = discord.PermissionOverwrite(
             read_messages=True, send_messages=True)
     # create and return the channel with its name and permissions
-    channel = await cat.create_text_channel(
-        new_channel_name, reason=NEW_CHANNEL_REASON)
-    await channel.edit(overwrites=overwrites, reason=NEW_CHANNEL_REASON)
+    try:
+        channel = await cat.create_text_channel(
+            new_channel_name, reason=NEW_CHANNEL_REASON)
+        await channel.edit(overwrites=overwrites, reason=NEW_CHANNEL_REASON)
+    except discord.Forbidden:
+        await send_error(ctx.respond, NO_PERMS_ERROR)
+        return None
     return channel
 
 async def notify_members(
     ctx: slash.Context,
     channel: discord.TextChannel,
+    dest: discord.TextChannel,
     members: List[discord.Member]
 ):
     """Complete the response and notify members if necessary."""
@@ -153,8 +166,11 @@ async def notify_members(
         channel=channel,
         key=key
     ))
-    perms = ctx.channel.permissions_for(ctx.me)
-    if not (perms.send_messages and perms.read_messages and perms.attach_files):
+    p1 = ctx.channel.permissions_for(ctx.me)
+    p1 = (p1.send_messages and p1.read_messages and p1.attach_files)
+    p2 = dest.permissions_for(ctx.me)
+    p2 = (p2.send_messages and p2.read_messages and p2.attach_files)
+    if not (p2 or p1):
         await ctx.webhook.send(PERMS_WARNING)
     if members:
         await ctx.webhook.send(' '.join(m.mention for m in members))
@@ -233,12 +249,22 @@ async def conclude(
     ctx: slash.Context,
     start: datetime,
     channel: discord.TextChannel,
-    filename: str
+    filename: str,
+    dest: Optional[discord.TextChannel]
 ):
     """Delete the channel and send its archive."""
     await channel.delete(reason=DELETE_REASON)
     content = CONVO_DONE.format(key=channel.name.split('-')[-1])
     attachment = discord.File(filename)
+    if dest:
+        try:
+            await dest.send(content, file=attachment)
+        except discord.Forbidden:
+            # failing to send can still close the file
+            attachment = discord.File(filename)
+        else:
+            os.unlink(filename)
+            return
     if (datetime.utcnow() - start).seconds < (10 * 60):
         await ctx.webhook.send(content, file=attachment)
     else:
@@ -246,6 +272,7 @@ async def conclude(
             await ctx.send(content, file=attachment)
         except discord.Forbidden:
             pass # welp, we warned them and we tried
+    os.unlink(filename)
 
 memberopts = [slash.Option(
     description=MEMBER_DESC % (i + 1),
@@ -253,13 +280,17 @@ memberopts = [slash.Option(
 timeoutopt = slash.Option(
     description=TIMEOUT_DESC,
     type=slash.ApplicationCommandOptionType.INTEGER)
+channelopt = slash.Option(
+    description=CHANNEL_DESC,
+    type=slash.ApplicationCommandOptionType.CHANNEL)
 
 @client.slash_cmd()
 async def split(
     ctx: slash.Context,
     timeout: timeoutopt = 5, member1: memberopts[0] = None,
     member2: memberopts[1] = None, member3: memberopts[2] = None,
-    member4: memberopts[3] = None, member5: memberopts[4] = None
+    member4: memberopts[3] = None, member5: memberopts[4] = None,
+    dest_channel: channelopt = None
 ):
     """Split the conversation into a new temporary channel."""
     members = [m for m in [member1, member2, member3, member4, member5] if m]
@@ -267,7 +298,7 @@ async def split(
     channel = await create_channel(ctx, members)
     if not channel:
         return
-    await notify_members(ctx, channel, members)
+    await notify_members(ctx, channel, dest_channel or ctx.channel, members)
     start = datetime.utcnow()
     await await_end(channel, timeout)
     # lock the channel
@@ -280,7 +311,7 @@ async def split(
         reason=LOCK_REASON
     )
     filename = await save_messages(start, channel)
-    await conclude(ctx, start, channel, filename)
+    await conclude(ctx, start, channel, filename, dest_channel)
 
 @client.slash_cmd()
 async def exit(ctx: slash.Context):
