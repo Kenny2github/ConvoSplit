@@ -1,55 +1,79 @@
-import sys
-import re
-import json
-from typing import Union
-import traceback
-import datetime
-import secrets
-import zlib
 import asyncio
+from datetime import datetime
+import json
+import os
+import secrets
+import traceback
+from typing import List, Optional
 import aiofiles
 import discord
-from discord.ext import commands, slash
+from discord.ext import slash
+from discord.ext import commands
 
-Ctx = commands.Context # type alias
-CATEGORY_NAME = 'ConvoSplit Temporary Channels'
+CONFIG_FILE = 'convosplit.json'
+
+NO_CAT_ERROR = """
+Missing channel category for temporary conversations.
+Please ask someone with permission to do so to create \
+a channel category with the word "ConvoSplit" anywhere \
+in the name.
+""".strip()
+BOT_DESC = 'Split conversations into temporary channels'
+MEMBER_DESC = 'Member #%s you want to limit discussion to.'
+TIMEOUT_DESC = """
+How long (in minutes) the channel can remain inactive before it is deleted. \
+Default 5.
+""".strip()
+NEW_CHANNEL_REASON = 'Creating temporary channel to split a conversation.'
+LOCK_REASON = 'Locking the channel while saving its messages.'
+DELETE_REASON = 'Conversation over.'
+SPLIT_RESPONSE = """
+Those in {author.mention}'s conversation \
+please move to {channel.mention} (convo {key}).
+""".strip()
+CONVO_DONE = 'Conversation {key} finished:'
+PERMS_WARNING = """
+\N{WARNING SIGN} **Warning**: I cannot send messages with a file as a bot \
+in this channel. If the conversation (including ending inactivity, if any) \
+lasts more than 10 minutes, its log will be lost!
+""".strip()
+FILENAME_FMT = '{name}---{start:%Y-%m-%d %H-%M-%S}---{end:%Y-%m-%d %H-%M-%S}.txt'
+SEPARATOR = '--New Message Starts After Two Line Feeds After This Line'
+
 MY_PERMS = discord.PermissionOverwrite(
     read_messages=True, read_message_history=True, send_messages=True,
     manage_permissions=True, embed_links=True
 )
 
-async def error(ctx: Union[discord.abc.Messageable, slash.Context], msg):
-    """Send a red Error embed."""
-    emb = discord.Embed(
-        title='Error',
-        description=str(msg),
-        color=0xff0000
-    )
-    if isinstance(ctx, slash.Context):
-        await ctx.respond(embeds=[emb])
-    else:
-        await ctx.send(embed=emb)
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-GUILD = 712215625178546219
+with open(CONFIG_FILE) as f:
+    CONFIG = json.load(f)
+
 client = slash.SlashBot(
-    '"', debug_guild=GUILD,
-    description='Split conversation into temporary channels')
+    description=BOT_DESC,
+    command_prefix=r'\/',
+    help_command=None,
+    activity=discord.Activity(
+        type=discord.ActivityType.watching, name='/split'),
+    debug_guild=CONFIG.get('guild_id', None),
+    resolve_not_fetch=False,
+    fetch_if_not_get=True
+)
 
-async def check_perms(ctx: slash.Context):
-    """Ensure all necessary permissions are given."""
-    perms: discord.Permissions = ctx.channel.permissions_for(ctx.me)
-    if not all((
-        perms.read_message_history, perms.read_messages, perms.send_messages,
-        perms.manage_channels, perms.embed_links
-    )):
-        raise commands.CheckFailure('Missing permissions')
+async def send_error(method, msg):
+    await method(embed=discord.Embed(
+        title='Error',
+        description=msg,
+        color=0xff0000
+    ))
 
 @client.event
 async def on_command_error(ctx, exc):
     """Silence some errors, defer some, send some, and print the rest."""
     if hasattr(ctx.command, 'on_error'):
         return
-    if isinstance(ctx, Ctx):
+    if isinstance(ctx, commands.Context):
         cog = ctx.cog
         if cog and hasattr(cog, 'cog_error'):
             return
@@ -60,193 +84,224 @@ async def on_command_error(ctx, exc):
         commands.BadArgument,
         commands.CommandOnCooldown,
     )):
-        return await error(ctx, exc)
+        return await send_error(ctx.send, exc)
     if isinstance(exc, (
         commands.CheckFailure,
         commands.CommandNotFound,
         commands.TooManyArguments,
     )):
         return
-    print('Ignoring exception in command {}:\n{}'.format(
-        ctx.command,
+    print(
+        'Ignoring exception in command {}:'.format(ctx.command),
         ''.join(traceback.format_exception(
-            type(exc), exc, exc.__traceback__))
-    ), end='', file=sys.stderr)
+            type(exc), exc, exc.__traceback__
+        )),
+        sep='\n', flush=True
+    )
 
-@client.event
-async def on_guild_join(guild: discord.Guild):
-    """Check that the ConvoSplit category exists upon joining a guild.
-    Create it if it doesn't, and send a "hi, I exist" message.
-    """
-    cat = discord.utils.get(guild.categories, name=CATEGORY_NAME)
-    for channel in guild.text_channels:
-        try:
-            if cat:
-                await channel.send(f"Hi! Run {client.command_prefix}split to "
-                                    "split the conversation into a new "
-                                    "temporary channel.")
-            else:
-                await channel.send("Hi! I'm about to create a channel category "
-                                    "for ConvoSplit channels to be created in. "
-                                    "Once I have, you can run "
-                                    + client.command_prefix
-                                    + " to split the conversation into a new "
-                                    "temporary channel.")
-        except discord.Forbidden:
-            continue
-        else:
-            break
-    else:
-        try:
-            await error(guild.owner, f"I can't send messages in {guild.name}!")
-        except:
-            pass
-        await guild.leave()
-        return
-    if not cat:
-        cat = await guild.create_category(
-            CATEGORY_NAME, reason="Creating category for temporary convos.")
-    await cat.edit(overwrites=MY_PERMS)
+def cat_check(cat: discord.CategoryChannel):
+    return 'convosplit' in cat.name.casefold()
 
-def convert_timeout(argument: str) -> datetime.timedelta:
-    """Convert timeouts into timedeltas."""
-    pieces = re.split(r'[^0-9]+', argument)[::-1]
-    try:
-        pieces = list(map(int, pieces))
-    except ValueError:
-        raise commands.BadArgument("timeout must have a number") from None
-    if not pieces:
-        raise commands.BadArgument("timeout must have a number") from None
-    multiples = [1, 60, 3_600, 86_400, 2_592_000, 31_536_000]
-    seconds: int = sum(i * j for i, j in zip(pieces, multiples))
-    return datetime.timedelta(seconds=seconds)
-
-
-memberopts = [slash.Option(
-    description=f'Member #{i+1} you want to limit discussion to.',
-    type=slash.ApplicationCommandOptionType.USER)
-              for i in range(5)]
-timeoutopt = slash.Option(
-    description='How long (HH:MM:SS) you want to wait '
-    'before deleting the channel. Default 05:00')
-
-@client.slash_cmd()
-async def split(
+async def create_channel(
     ctx: slash.Context,
-    timeout: timeoutopt = datetime.timedelta(minutes=5),
-    member1: memberopts[0] = None, member2: memberopts[1] = None,
-    member3: memberopts[2] = None, member4: memberopts[3] = None,
-    member5: memberopts[4] = None
-):
-    """Split conversation into a new temporary channel."""
-    await check_perms(ctx)
-    if not isinstance(timeout, datetime.timedelta):
-        try:
-            timeout = convert_timeout(timeout)
-        except commands.BadArgument as exc:
-            await error(ctx, str(exc))
-            return
-    members = list(filter(None, [member1, member2, member3, member4, member5]))
-    # create temporary channel
-    cat: discord.CategoryChannel = discord.utils.get(
-        await ctx.guild.fetch_channels(), name=CATEGORY_NAME)
+    members: List[discord.Member]
+) -> Optional[discord.TextChannel]:
+    """Create a new temporary channel."""
+    cat: discord.CategoryChannel = discord.utils.find(
+        cat_check, await ctx.guild.fetch_channels())
     if not cat:
-        await error(ctx, "Category for temporary conversations is deleted!")
-        return
-    key = secrets.token_hex(4)
-    name = 'convo-' + key
-    # set permissions for private channel
-    permows = {}
-    permows[ctx.me] = MY_PERMS
+        await send_error(ctx.respond, NO_CAT_ERROR)
+        return None
+    new_channel_name = 'convo-' + secrets.token_hex(4)
+    overwrites = {}
+    # mirror originating channel permissions
+    overwrites.update(ctx.channel.overwrites)
+    # I reign supreme
+    overwrites[ctx.me] = MY_PERMS
+    overwrites.setdefault(ctx.guild.default_role, discord.PermissionOverwrite(
+        read_messages=True, send_messages=True))
     if members:
-        permows[ctx.guild.default_role] \
-            = discord.PermissionOverwrite(send_messages=False)
+        # in case the originating channel allows more than just these
+        # people to send messages, explicitly disallow sending messages
+        # for everyone else
+        for user_or_role, overws in overwrites.items():
+            if user_or_role is ctx.me:
+                continue # don't deny myself lol
+            overws.send_messages = False
+        # explicitly allow sending messages for the actual members
         for member in members:
-            permows[member] = discord.PermissionOverwrite(send_messages=True)
-        # don't let the convo splitter lock themself out
-        permows[ctx.author] = discord.PermissionOverwrite(send_messages=True)
+            overwrites[member] = discord.PermissionOverwrite(
+                read_messages=True, send_messages=True)
+        # don't let the invoker lock themself out
+        overwrites[ctx.author] = discord.PermissionOverwrite(
+            read_messages=True, send_messages=True)
+    # create and return the channel with its name and permissions
     channel = await cat.create_text_channel(
-        name, overwrites=permows, reason="By request of user.")
-    # mention the new channel
+        new_channel_name, reason=NEW_CHANNEL_REASON)
+    await channel.edit(overwrites=overwrites, reason=NEW_CHANNEL_REASON)
+    return channel
+
+async def notify_members(
+    ctx: slash.Context,
+    channel: discord.TextChannel,
+    members: List[discord.Member]
+):
+    """Complete the response and notify members if necessary."""
+    key = channel.name.split('-')[-1]
+    await ctx.respond(SPLIT_RESPONSE.format(
+        author=ctx.author,
+        channel=channel,
+        key=key
+    ))
+    perms = ctx.channel.permissions_for(ctx.me)
+    if not (perms.send_messages and perms.read_messages and perms.attach_files):
+        await ctx.webhook.send(PERMS_WARNING)
     if members:
-        people = '(' + ', '.join(m.mention for m in members) + ') '
-    else:
-        people = ''
-    start = datetime.datetime.utcnow()
-    await ctx.respond(f"Those in {ctx.author.mention}'s conversation {people}"
-                      f"please move to {channel.mention} (convo {key})")
-    # record messages
-    msgs = []
+        await ctx.webhook.send(' '.join(m.mention for m in members))
+
+def is_goodbye(content: str) -> bool:
+    content = content.lstrip().casefold()
+    return content.startswith('goodbye')
+
+async def await_end(
+    channel: discord.TextChannel,
+    timeout: int
+) -> List[discord.Message]:
+    """Wait for the conversation to end, by timeout or /exit."""
     while 1:
         try:
             msg = await client.wait_for(
                 'message', check=lambda m: m.channel.id == channel.id,
-                timeout=timeout.total_seconds())
+                timeout=timeout * 60)
         except asyncio.TimeoutError:
-            break
-        if (
-            msg.author.id == ctx.author.id
-            and getattr(msg.type, 'value', msg.type) == 20 # interaction
-            and msg.content.lstrip().casefold().startswith('</exit')
-        ):
-            break
-        msgs.append(msg)
-    await channel.send('Goodbye.')
-    # immediately lock the channel
+            await channel.send('Goodbye.')
+            return
+        if msg.author.id == client.user.id and is_goodbye(msg.content):
+            return
+
+async def format_message(msg: discord.Message) -> str:
+    """Format a message into multipart-like format."""
+    lines = []
+    lines.append(f'Message-Id: {msg.id}')
+    lines.append(f'Author: {msg.author!s} ({msg.author.id})')
+    lines.append(f'Sent: {msg.created_at.isoformat()}')
+    if msg.edited_at:
+        lines.append(f'Edited: {msg.edited_at.isoformat()}')
+    if msg.reference:
+        if msg.type == discord.MessageType.pins_add:
+            lines.append(f'Pins: {msg.reference.message_id}')
+        else:
+            lines.append(f'Reply-To: {msg.reference.message_id}')
+    for r in msg.reactions:
+        users = []
+        async for user in r.users():
+            users.append(f'{user!s} ({user.id})')
+        lines.append(f'Reaction: {r!s}; {", ".join(users)}')
+    for f in msg.attachments:
+        lines.append('Attachment: name={}, content_type={}, url={}'.format(
+            f.filename, f.content_type or 'Unspecified', f.url
+        ))
+    for e in msg.embeds:
+        lines.append(f'Embed: {json.dumps(e.to_dict())}')
+    lines.append('')
+    if msg.is_system():
+        lines.append(msg.system_content)
+    else:
+        lines.append(msg.content)
+    return '\n'.join(lines)
+
+async def save_messages(
+    start: datetime,
+    channel: discord.TextChannel
+) -> str:
+    """Save messages to a file. Return its name."""
+    filename = os.path.join('convos', FILENAME_FMT.format(
+        name=channel.name,
+        start=start,
+        end=datetime.utcnow()
+    ))
+    async with aiofiles.open(filename, 'w', encoding='utf8') as dump:
+        async for msg in channel.history(oldest_first=True):
+            if msg.author.id == client.user.id and is_goodbye(msg.content):
+                continue
+            await dump.write(SEPARATOR + '\n'
+                             + (await format_message(msg)) + '\n')
+        await dump.write(SEPARATOR + '--\n')
+    return filename
+
+async def conclude(
+    ctx: slash.Context,
+    start: datetime,
+    channel: discord.TextChannel,
+    filename: str
+):
+    """Delete the channel and send its archive."""
+    await channel.delete(reason=DELETE_REASON)
+    content = CONVO_DONE.format(key=channel.name.split('-')[-1])
+    attachment = discord.File(filename)
+    if (datetime.utcnow() - start).seconds < (10 * 60):
+        await ctx.webhook.send(content, file=attachment)
+    else:
+        try:
+            await ctx.send(content, file=attachment)
+        except discord.Forbidden:
+            pass # welp, we warned them and we tried
+
+memberopts = [slash.Option(
+    description=MEMBER_DESC % (i + 1),
+    type=slash.ApplicationCommandOptionType.USER) for i in range(5)]
+timeoutopt = slash.Option(
+    description=TIMEOUT_DESC,
+    type=slash.ApplicationCommandOptionType.INTEGER)
+
+@client.slash_cmd()
+async def split(
+    ctx: slash.Context,
+    timeout: timeoutopt = 5, member1: memberopts[0] = None,
+    member2: memberopts[1] = None, member3: memberopts[2] = None,
+    member4: memberopts[3] = None, member5: memberopts[4] = None
+):
+    """Split the conversation into a new temporary channel."""
+    members = [m for m in [member1, member2, member3, member4, member5] if m]
+    await ctx.respond(deferred=True)
+    channel = await create_channel(ctx, members)
+    if not channel:
+        return
+    await notify_members(ctx, channel, members)
+    start = datetime.utcnow()
+    await await_end(channel, timeout)
+    # lock the channel
     await channel.edit(
         overwrites={
             ctx.guild.default_role: discord.PermissionOverwrite(
                 read_messages=False, send_messages=False),
             ctx.me: MY_PERMS
         },
-        reason="Locking the channel")
-    # dump messages to file
-    filename = f'convos/{start:%Y-%m-%d %Hh%Mm%Ss} ' \
-        f'- {msg.created_at:%Y-%m-%d %Hh%Mm%Ss}.txt'
-    async with aiofiles.open(filename, 'w') as dump:
-        for msg in msgs:
-            await dump.write(
-                f'\n--- {msg.created_at.isoformat()} '
-                + (f'(edited {msg.edited_at.isoformat()}) '
-                   if msg.edited_at else '')
-                + f'{msg.author!s} '
-                f'({msg.author.display_name}) (user {msg.author.id}) '
-                f'(message {msg.id}) ---\n')
-            await dump.write(msg.content)
-    # delete channel and send log
-    await channel.delete()
-    await ctx.send(f'Convo {key} finished:', file=discord.File(filename))
+        reason=LOCK_REASON
+    )
+    filename = await save_messages(start, channel)
+    await conclude(ctx, start, channel, filename)
 
 @client.slash_cmd()
 async def exit(ctx: slash.Context):
-    """Conclude a split convo."""
-    await ctx.respond(rtype=slash.InteractionResponseType.AcknowledgeWithSource)
+    """End the conversation and archive the channel."""
+    await ctx.respond('Goodbye.')
 
 @client.slash_cmd()
-async def hello(ctx: slash.Context):
-    """Hello World!"""
-    await ctx.respond('Hello World!')
+async def invite(ctx: slash.Context):
+    """Get a link to invite this bot to your server."""
+    await ctx.respond(CONFIG['url'], ephemeral=True)
 
-@client.slash_cmd()
-async def say(ctx: slash.Context, message: slash.Option(
-    description='The message to send', required=True
-)):
-    """Say something silently."""
-    await ctx.respond(message, rtype=slash.InteractionResponseType.ChannelMessage)
-
-@client.slash_cmd()
-async def stop(ctx: slash.Context):
-    """Stop the bot."""
-    if ctx.author.id != client.app_info.owner.id:
-        await error(ctx, 'You are not the owner.')
-        return
-    await ctx.respond(rtype=slash.InteractionResponseType.AcknowledgeWithSource)
-    await client.close()
-
-with open('convosplit.txt') as f:
-    TOKEN = f.readline().strip()
+async def wakeup():
+    while 1:
+        try:
+            await asyncio.sleep(1)
+        except:
+            await client.close()
+            return
 
 try:
-    client.run(TOKEN)
+    client.loop.create_task(wakeup())
+    client.run(CONFIG['token'])
 finally:
     print('Goodbye.')
